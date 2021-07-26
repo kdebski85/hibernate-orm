@@ -28,6 +28,7 @@ import org.hibernate.metamodel.mapping.ModelPart;
 import org.hibernate.persister.entity.EntityPersister;
 import org.hibernate.persister.entity.Queryable;
 import org.hibernate.query.IllegalQueryOperationException;
+import org.hibernate.query.sqm.sql.internal.SqmPathInterpretation;
 import org.hibernate.sql.ast.tree.cte.CteMaterialization;
 import org.hibernate.sql.ast.tree.cte.CteSearchClauseKind;
 import org.hibernate.query.FetchClauseType;
@@ -152,9 +153,11 @@ import org.hibernate.sql.exec.spi.JdbcParameterBinding;
 import org.hibernate.sql.exec.spi.JdbcParameterBindings;
 import org.hibernate.sql.exec.spi.JdbcSelect;
 import org.hibernate.sql.exec.spi.JdbcUpdate;
+import org.hibernate.sql.results.internal.SqlSelectionImpl;
 import org.hibernate.sql.results.jdbc.internal.JdbcValuesMappingProducerStandard;
 import org.hibernate.type.BasicType;
 import org.hibernate.type.IntegerType;
+import org.hibernate.type.StandardBasicTypes;
 import org.hibernate.type.StringType;
 import org.hibernate.type.descriptor.WrapperOptions;
 import org.hibernate.type.descriptor.jdbc.JdbcLiteralFormatter;
@@ -190,7 +193,12 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 	private final Set<String> affectedTableNames = new HashSet<>();
 	private String dmlTargetTableAlias;
 	private boolean needsSelectAliases;
+	// We must reset the queryPartForRowNumbering fields to null if a query part is visited that does not
+	// contribute to the row numbering i.e. if the query part is a sub-query in the where clause.
+	// To determine whether a query part contributes to row numbering, we remember the clause depth
+	// and when visiting a query part, compare the current clause depth against the remembered one.
 	private QueryPart queryPartForRowNumbering;
+	private int queryPartForRowNumberingClauseDepth = -1;
 	private int queryPartForRowNumberingAliasCounter;
 	private int queryGroupAliasCounter;
 	private transient AbstractSqmSelfRenderingFunctionDescriptor castFunction;
@@ -1341,22 +1349,51 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 
 	protected void renderQueryGroup(QueryGroup queryGroup, boolean renderOrderByAndOffsetFetchClause) {
 		final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+		final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 		final boolean needsSelectAliases = this.needsSelectAliases;
 		try {
 			String queryGroupAlias = null;
+			// See the field documentation of queryPartForRowNumbering etc. for an explanation about this
 			final QueryPart currentQueryPart = queryPartStack.getCurrent();
-			if ( currentQueryPart != null && queryPartForRowNumbering != currentQueryPart ) {
+			if ( currentQueryPart != null && queryPartForRowNumberingClauseDepth != clauseStack.depth() ) {
 				this.queryPartForRowNumbering = null;
+				this.queryPartForRowNumberingClauseDepth = -1;
 				this.needsSelectAliases = false;
 			}
-			// If we do row counting for this query group, the wrapper select is added by the caller
-			if ( queryPartForRowNumbering != queryGroup && !queryGroup.isRoot() ) {
+			// If we are row numbering the current query group, this means that we can't render the
+			// order by and offset fetch clause, so we must do row counting on the query group level
+			if ( queryPartForRowNumbering == queryGroup ) {
 				this.needsSelectAliases = true;
 				queryGroupAlias = "grp_" + queryGroupAliasCounter + "_";
 				queryGroupAliasCounter++;
 				appendSql( "select " );
 				appendSql( queryGroupAlias );
-				appendSql( ".* from (" );
+				appendSql( ".* " );
+				final SelectClause firstSelectClause = queryGroup.getFirstQuerySpec().getSelectClause();
+				final List<SqlSelection> sqlSelections = firstSelectClause.getSqlSelections();
+				final int sqlSelectionsSize = sqlSelections.size();
+				// We need this synthetic select clause to properly render the ORDER BY within the OVER clause
+				// of the row numbering functions
+				final SelectClause syntheticSelectClause = new SelectClause( sqlSelectionsSize );
+				for ( int i = 0; i < sqlSelectionsSize; i++ ) {
+					syntheticSelectClause.addSqlSelection(
+							new SqlSelectionImpl(
+									i + 1,
+									i,
+									new ColumnReference(
+											queryGroupAlias,
+											"c" + i,
+											false,
+											null,
+											null,
+											StandardBasicTypes.INTEGER,
+											null
+									)
+							)
+					);
+				}
+				renderRowNumberingSelectItems( syntheticSelectClause, queryPartForRowNumbering );
+				appendSql( " from (" );
 			}
 			queryPartStack.push( queryGroup );
 			final List<QueryPart> queryParts = queryGroup.getQueryParts();
@@ -1380,6 +1417,7 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 		finally {
 			queryPartStack.pop();
 			this.queryPartForRowNumbering = queryPartForRowNumbering;
+			this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 			this.needsSelectAliases = needsSelectAliases;
 		}
 	}
@@ -1387,13 +1425,16 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 	@Override
 	public void visitQuerySpec(QuerySpec querySpec) {
 		final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+		final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 		final boolean needsSelectAliases = this.needsSelectAliases;
 		final ForUpdateClause forUpdate = this.forUpdate;
 		try {
 			this.forUpdate = null;
+			// See the field documentation of queryPartForRowNumbering etc. for an explanation about this
 			final QueryPart currentQueryPart = queryPartStack.getCurrent();
-			if ( currentQueryPart != null && queryPartForRowNumbering != currentQueryPart ) {
+			if ( currentQueryPart != null && ( queryPartForRowNumbering instanceof QueryGroup || queryPartForRowNumberingClauseDepth != clauseStack.depth() ) ) {
 				this.queryPartForRowNumbering = null;
+				this.queryPartForRowNumberingClauseDepth = -1;
 			}
 			String queryGroupAlias = "";
 			final boolean needsParenthesis;
@@ -1402,14 +1443,15 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 				if ( needsParenthesis = querySpec.hasOffsetOrFetchClause() ) {
 					// If the parent is a query group with a fetch clause, we must use an alias
 					// Some DBMS don't support grouping query expressions and need a select wrapper
-					if ( !supportsSimpleQueryGrouping() || currentQueryPart.hasOffsetOrFetchClause() ) {
-						this.needsSelectAliases = true;
-						queryGroupAlias = " grp_" + queryGroupAliasCounter + "_";
-						queryGroupAliasCounter++;
-						appendSql( "select" );
-						appendSql( queryGroupAlias );
-						appendSql( ".* from " );
-					}
+//					if ( !supportsSimpleQueryGrouping() || currentQueryPart.hasOffsetOrFetchClause() ) {
+//						this.needsSelectAliases = true;
+//						queryGroupAlias = " grp_" + queryGroupAliasCounter + "_";
+//						queryGroupAliasCounter++;
+//						appendSql( "select" );
+//						appendSql( queryGroupAlias );
+//						appendSql( ".* from " );
+//					}
+					// todo: remove?
 				}
 			}
 			else {
@@ -1417,7 +1459,7 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			}
 			queryPartStack.push( querySpec );
 			if ( needsParenthesis ) {
-				appendSql( "(" );
+				appendSql( '(' );
 			}
 			visitSelectClause( querySpec.getSelectClause() );
 			visitFromClause( querySpec.getFromClause() );
@@ -1432,13 +1474,14 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			}
 
 			if ( needsParenthesis ) {
-				appendSql( ")" );
+				appendSql( ')' );
 				appendSql( queryGroupAlias );
 			}
 		}
 		finally {
 			this.queryPartStack.pop();
 			this.queryPartForRowNumbering = queryPartForRowNumbering;
+			this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 			this.needsSelectAliases = needsSelectAliases;
 			if ( queryPartForRowNumbering == null ) {
 				this.forUpdate = forUpdate;
@@ -1466,6 +1509,12 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 	}
 
 	protected Expression resolveAliasedExpression(Expression expression) {
+		// This can happen when using window functions for emulating the offset/fetch clause of a query group
+		// But in that case we always use a SqlSelectionExpression anyway, so this is fine as it doesn't need resolving
+		if ( queryPartStack.getCurrent() == null ) {
+			assert expression instanceof SqlSelectionExpression;
+			return ( (SqlSelectionExpression) expression ).getSelection().getExpression();
+		}
 		return resolveAliasedExpression(
 				queryPartStack.getCurrent().getFirstQuerySpec().getSelectClause().getSqlSelections(),
 				expression
@@ -1481,6 +1530,12 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 		}
 		else if ( expression instanceof SqlSelectionExpression ) {
 			return ( (SqlSelectionExpression) expression ).getSelection().getExpression();
+		}
+		else if ( expression instanceof SqmPathInterpretation<?> ) {
+			final Expression sqlExpression = ( (SqmPathInterpretation<?>) expression ).getSqlExpression();
+			if ( sqlExpression instanceof SqlSelectionExpression ) {
+				return ( (SqlSelectionExpression) sqlExpression ).getSelection().getExpression();
+			}
 		}
 		return expression;
 	}
@@ -1944,7 +1999,7 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 		}
 	}
 
-	public void visitSortSpecification(Expression sortExpression, SortOrder sortOrder, NullPrecedence nullPrecedence) {
+	protected void visitSortSpecification(Expression sortExpression, SortOrder sortOrder, NullPrecedence nullPrecedence) {
 		if ( nullPrecedence == null || nullPrecedence == NullPrecedence.NONE ) {
 			nullPrecedence = sessionFactory.getSessionFactoryOptions().getDefaultNullPrecedence();
 		}
@@ -2610,12 +2665,25 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			FetchClauseType fetchClauseType,
 			boolean emulateFetchClause) {
 		final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+		final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 		final boolean needsSelectAliases = this.needsSelectAliases;
 		try {
 			this.queryPartForRowNumbering = queryPart;
+			this.queryPartForRowNumberingClauseDepth = clauseStack.depth();
 			this.needsSelectAliases = true;
 			final String alias = "r_" + queryPartForRowNumberingAliasCounter + "_";
 			queryPartForRowNumberingAliasCounter++;
+			final boolean needsParenthesis;
+			if ( queryPart instanceof QueryGroup ) {
+				// We always need query wrapping if we are in a query group and the query part has a fetch clause
+				needsParenthesis = queryPart.hasOffsetOrFetchClause();
+			}
+			else {
+				needsParenthesis = !queryPart.isRoot();
+			}
+			if ( needsParenthesis && !queryPart.isRoot() ) {
+				appendSql( '(' );
+			}
 			appendSql( "select " );
 			if ( getClauseStack().isEmpty() ) {
 				appendSql( "*" );
@@ -2631,15 +2699,21 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 					separator = COMA_SEPARATOR;
 				}
 			}
-			appendSql( " from (" );
+			appendSql( " from " );
+			if ( !needsParenthesis || queryPart.isRoot() ) {
+				appendSql( '(' );
+			}
 			queryPart.accept( this );
-			appendSql( ") ");
+			if ( !needsParenthesis || queryPart.isRoot() ) {
+				appendSql( ')' );
+			}
+			appendSql( ' ');
 			appendSql( alias );
 			appendSql( " where " );
 			final Stack<Clause> clauseStack = getClauseStack();
 			clauseStack.push( Clause.WHERE );
 			try {
-				if ( emulateFetchClause ) {
+				if ( emulateFetchClause && fetchExpression != null ) {
 					switch ( fetchClauseType ) {
 						case PERCENT_ONLY:
 							appendSql( alias );
@@ -2657,6 +2731,10 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 						case ROWS_ONLY:
 							appendSql( alias );
 							appendSql( ".rn <= " );
+							if ( offsetExpression != null ) {
+								offsetExpression.accept( this );
+								appendSql( " + " );
+							}
 							fetchExpression.accept( this );
 							break;
 						case PERCENT_WITH_TIES:
@@ -2675,37 +2753,45 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 						case ROWS_WITH_TIES:
 							appendSql( alias );
 							appendSql( ".rnk <= " );
+							if ( offsetExpression != null ) {
+								offsetExpression.accept( this );
+								appendSql( " + " );
+							}
 							fetchExpression.accept( this );
 							break;
 					}
 				}
 				// todo: not sure if databases handle order by row number or the original ordering better..
 				if ( offsetExpression == null ) {
-					switch ( fetchClauseType ) {
-						case PERCENT_ONLY:
-						case ROWS_ONLY:
-							appendSql( " order by " );
-							appendSql( alias );
-							appendSql( ".rn" );
-							break;
-						case PERCENT_WITH_TIES:
-						case ROWS_WITH_TIES:
-							appendSql( " order by " );
-							appendSql( alias );
-							appendSql( ".rnk" );
-							break;
+					if ( queryPart.isRoot() ) {
+						switch ( fetchClauseType ) {
+							case PERCENT_ONLY:
+							case ROWS_ONLY:
+								appendSql( " order by " );
+								appendSql( alias );
+								appendSql( ".rn" );
+								break;
+							case PERCENT_WITH_TIES:
+							case ROWS_WITH_TIES:
+								appendSql( " order by " );
+								appendSql( alias );
+								appendSql( ".rnk" );
+								break;
+						}
 					}
 				}
 				else {
-					if ( emulateFetchClause ) {
+					if ( emulateFetchClause && fetchExpression != null ) {
 						appendSql( " and " );
 					}
 					appendSql( alias );
 					appendSql( ".rn > " );
 					offsetExpression.accept( this );
-					appendSql( " order by " );
-					appendSql( alias );
-					appendSql( ".rn" );
+					if ( queryPart.isRoot() ) {
+						appendSql( " order by " );
+						appendSql( alias );
+						appendSql( ".rn" );
+					}
 				}
 
 				// We render the FOR UPDATE clause in the outer query
@@ -2718,23 +2804,30 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			finally {
 				clauseStack.pop();
 			}
+			if ( needsParenthesis && !queryPart.isRoot() ) {
+				appendSql( ')' );
+			}
 		}
 		finally {
 			this.queryPartForRowNumbering = queryPartForRowNumbering;
+			this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 			this.needsSelectAliases = needsSelectAliases;
 		}
 	}
 
 	protected final void withRowNumbering(QueryPart queryPart, Runnable r) {
 		final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+		final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 		final boolean needsSelectAliases = this.needsSelectAliases;
 		try {
 			this.queryPartForRowNumbering = queryPart;
+			this.queryPartForRowNumberingClauseDepth = clauseStack.depth();
 			this.needsSelectAliases = false;
 			r.run();
 		}
 		finally {
 			this.queryPartForRowNumbering = queryPartForRowNumbering;
+			this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 			this.needsSelectAliases = needsSelectAliases;
 		}
 	}
@@ -2773,37 +2866,7 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 				separator = COMA_SEPARATOR;
 			}
 			if ( queryPartForRowNumbering != null ) {
-				final FetchClauseType fetchClauseType = getFetchClauseTypeForRowNumbering( queryPartForRowNumbering );
-				if ( fetchClauseType != null ) {
-					appendSql( separator );
-					switch ( fetchClauseType ) {
-						case PERCENT_ONLY:
-							appendSql( "count(*) over () cnt," );
-						case ROWS_ONLY:
-							renderRowNumber( selectClause, queryPartForRowNumbering );
-							appendSql( " rn" );
-							break;
-						case PERCENT_WITH_TIES:
-							appendSql( "count(*) over () cnt," );
-						case ROWS_WITH_TIES:
-							if ( queryPartForRowNumbering.getOffsetClauseExpression() != null ) {
-								renderRowNumber( selectClause, queryPartForRowNumbering );
-								appendSql( " rn, " );
-							}
-							if ( selectClause.isDistinct() ) {
-								appendSql( "dense_rank()" );
-							}
-							else {
-								appendSql( "rank()" );
-							}
-							visitOverClause(
-									Collections.emptyList(),
-									getSortSpecificationsRowNumbering( selectClause, queryPartForRowNumbering )
-							);
-							appendSql( " rnk" );
-							break;
-					}
-				}
+				renderRowNumberingSelectItems( selectClause, queryPartForRowNumbering );
 			}
 		}
 		else {
@@ -2813,6 +2876,40 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 				appendSql( separator );
 				visitSqlSelection( sqlSelection );
 				separator = COMA_SEPARATOR;
+			}
+		}
+	}
+
+	protected void renderRowNumberingSelectItems(SelectClause selectClause, QueryPart queryPart) {
+		final FetchClauseType fetchClauseType = getFetchClauseTypeForRowNumbering( queryPart );
+		if ( fetchClauseType != null ) {
+			appendSql( COMA_SEPARATOR );
+			switch ( fetchClauseType ) {
+				case PERCENT_ONLY:
+					appendSql( "count(*) over () cnt," );
+				case ROWS_ONLY:
+					renderRowNumber( selectClause, queryPart );
+					appendSql( " rn" );
+					break;
+				case PERCENT_WITH_TIES:
+					appendSql( "count(*) over () cnt," );
+				case ROWS_WITH_TIES:
+					if ( queryPart.getOffsetClauseExpression() != null ) {
+						renderRowNumber( selectClause, queryPart );
+						appendSql( " rn, " );
+					}
+					if ( selectClause.isDistinct() ) {
+						appendSql( "dense_rank()" );
+					}
+					else {
+						appendSql( "rank()" );
+					}
+					visitOverClause(
+							Collections.emptyList(),
+							getSortSpecificationsRowNumbering( selectClause, queryPart )
+					);
+					appendSql( " rnk" );
+					break;
 			}
 		}
 	}
@@ -2897,6 +2994,39 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 				}
 				return sortSpecificationsRowNumbering;
 			}
+		}
+		else if ( queryPart instanceof QueryGroup ) {
+			// When the sort specifications come from a query group which uses positional references
+			// we have to resolve to the actual selection expressions
+			final int specificationsSize = sortSpecifications.size();
+			final List<SortSpecification> sortSpecificationsRowNumbering = new ArrayList<>( specificationsSize );
+			final List<SqlSelection> sqlSelections = selectClause.getSqlSelections();
+			for ( int i = 0; i < specificationsSize; i++ ) {
+				final SortSpecification sortSpecification = sortSpecifications.get( i );
+				final int position;
+				if ( sortSpecification.getSortExpression() instanceof SqlSelectionExpression ) {
+					position = ( (SqlSelectionExpression) sortSpecification.getSortExpression() )
+							.getSelection()
+							.getValuesArrayPosition();
+				}
+				else {
+					assert sortSpecification.getSortExpression() instanceof QueryLiteral;
+					final QueryLiteral<?> queryLiteral = (QueryLiteral<?>) sortSpecification.getSortExpression();
+					assert queryLiteral.getLiteralValue() instanceof Integer;
+					position = (Integer) queryLiteral.getLiteralValue();
+				}
+				sortSpecificationsRowNumbering.add(
+						new SortSpecification(
+								new SqlSelectionExpression(
+										sqlSelections.get( position )
+								),
+								null,
+								sortSpecification.getSortOrder(),
+								sortSpecification.getNullPrecedence()
+						)
+				);
+			}
+			return sortSpecificationsRowNumbering;
 		}
 		else {
 			return sortSpecifications;
@@ -4163,9 +4293,11 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			}
 
 			final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+			final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 			final boolean needsSelectAliases = this.needsSelectAliases;
 			try {
 				this.queryPartForRowNumbering = null;
+				this.queryPartForRowNumberingClauseDepth = -1;
 				this.needsSelectAliases = false;
 				queryPartStack.push( subQuery );
 				appendSql( "exists (select 1" );
@@ -4218,11 +4350,12 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 					}
 				}
 
-				appendSql( ")" );
+				appendSql( ')' );
 			}
 			finally {
 				queryPartStack.pop();
 				this.queryPartForRowNumbering = queryPartForRowNumbering;
+				this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 				this.needsSelectAliases = needsSelectAliases;
 			}
 		}
@@ -4255,12 +4388,14 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 			appendSql( " " );
 
 			final QueryPart queryPartForRowNumbering = this.queryPartForRowNumbering;
+			final int queryPartForRowNumberingClauseDepth = this.queryPartForRowNumberingClauseDepth;
 			final boolean needsSelectAliases = this.needsSelectAliases;
 			try {
 				this.queryPartForRowNumbering = null;
+				this.queryPartForRowNumberingClauseDepth = -1;
 				this.needsSelectAliases = false;
 				queryPartStack.push( subQuery );
-				appendSql( "(" );
+				appendSql( '(' );
 				visitSelectClause( subQuery.getSelectClause() );
 				visitFromClause( subQuery.getFromClause() );
 				visitWhereClause( subQuery );
@@ -4285,11 +4420,12 @@ public abstract class AbstractSqlAstTranslator<T extends JdbcOperation> implemen
 					appendSql( order );
 				}
 				renderFetch( ONE_LITERAL, null, FetchClauseType.ROWS_ONLY );
-				appendSql( ")" );
+				appendSql( ')' );
 			}
 			finally {
 				queryPartStack.pop();
 				this.queryPartForRowNumbering = queryPartForRowNumbering;
+				this.queryPartForRowNumberingClauseDepth = queryPartForRowNumberingClauseDepth;
 				this.needsSelectAliases = needsSelectAliases;
 			}
 		}
